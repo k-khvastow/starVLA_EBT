@@ -1,10 +1,9 @@
 import logging
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +95,7 @@ class EBTBlockWithCrossAttn(nn.Module):
         x = x + self.ffn(self.norm3(x))
         return x
 
+
 class TransformerForEBT_Layerwise(nn.Module):
     def __init__(self, action_dim, cond_dim, horizon, n_layer=6, n_head=8, n_emb=512):
         super().__init__()
@@ -128,14 +128,13 @@ class TransformerForEBT_Layerwise(nn.Module):
 
     def forward(self, actions: torch.Tensor, cond_list: List[torch.Tensor]) -> torch.Tensor:
         """
-        Calculates Energy for action sequence given layer-wise VLM context.
+        Calculates Scalar Energy for action sequence given layer-wise VLM context.
         """
         x = self.action_emb(actions) + self.pos_emb[:, :actions.shape[1], :]
         x = self.drop(x)
         
-        # Iterate through EBT layers, each attending to corresponding VLM layer
         for i, layer in enumerate(self.layers):
-            # Pick corresponding VLM layer (assuming list is aligned or we take last N)
+            # Select VLM layer (aligns with EBT depth)
             vlm_feats = cond_list[i]
             context = self.obs_emb_proj(vlm_feats)
             x = layer(x, context)
@@ -143,9 +142,9 @@ class TransformerForEBT_Layerwise(nn.Module):
         x = self.norm(x)
         energies = self.energy_head(x).squeeze(-1)
         
-        # Return mean energy of the sequence
-        return energies.mean(dim=1)
-
+        # Return total energy (scalar) for gradient computation
+        # Using sum() preserves gradient magnitude better for optimization than mean()
+        return energies.sum() 
 
 class LayerwiseEBTActionHead(nn.Module):
     def __init__(self, full_config):
@@ -155,14 +154,22 @@ class LayerwiseEBTActionHead(nn.Module):
         self.action_dim = config.action_dim
         self.horizon = config.future_action_window_size + 1
         
-        # Training / MCMC Params
-        self.train_n_mcmc = getattr(config, 'train_n_mcmc', 10)
-        self.inference_n_mcmc = getattr(config, 'inference_n_mcmc', 30)
-        self.mcmc_noise_scale = getattr(config, 'mcmc_noise_scale', 0.01)
-        self.energy_reg_weight = getattr(config, 'energy_reg_weight', 1.0)
+        # --- MCMC & Training Params ---
+        # Number of steps to run optimization loop during training
+        self.train_inference_steps = getattr(config, 'train_inference_steps', 10) 
+        self.inference_steps = getattr(config, 'inference_steps', 30)
         
-        # Learnable Step Size
-        self.alpha = nn.Parameter(torch.tensor(0.01), requires_grad=True)
+        # Gradient Descent Step Size (Alpha) - Learnable
+        init_alpha = getattr(config, 'mcmc_step_size', 0.01)
+        self.alpha = nn.Parameter(torch.tensor(init_alpha), requires_grad=True)
+        
+        # Langevin Noise
+        init_noise = getattr(config, 'langevin_noise_std', 0.001)
+        self.langevin_noise_std = nn.Parameter(torch.tensor(init_noise), requires_grad=True)
+
+        # Constraints
+        self.clip_grad_value = getattr(config, 'clip_grad_value', 1.0)
+        self.clamp_actions_value = getattr(config, 'clamp_actions_value', 1.0) # Assume normalized actions [-1, 1]
 
         self.model = TransformerForEBT_Layerwise(
             action_dim=self.action_dim,
@@ -173,65 +180,96 @@ class LayerwiseEBTActionHead(nn.Module):
             n_emb=getattr(config, 'ebt_emb_dim', 512),
         )
 
-    def langevin_sampler(self, current_actions, cond_list, n_steps, step_size, noise_scale, train_mode=False):
+    def _mcmc_step(self, actions, cond_list, create_graph=False, add_noise=True):
         """
-        Samples low-energy actions (Negatives) via Langevin Dynamics.
+        Perform one MCMC gradient descent step to minimize energy.
+        IMPORTANT: create_graph=True allows differentiating through this step.
         """
-        actions = current_actions.detach().clone()
-        actions.requires_grad_(True)
-        
-        for _ in range(n_steps):
-            energy = self.model(actions, cond_list)
-            # Minimize energy (gradient descent)
-            grad = torch.autograd.grad(energy.sum(), actions, create_graph=train_mode)[0]
-            noise = torch.randn_like(actions) * noise_scale
-            actions = actions - step_size * grad + noise
+        with torch.enable_grad():
+            # Ensure actions require grad for energy computation
+            actions = actions.detach().requires_grad_(True)
             
-        return actions
+            # 1. Add Langevin Noise (Exploration)
+            if add_noise and self.langevin_noise_std > 0:
+                noise = torch.randn_like(actions) * self.langevin_noise_std
+                actions_noisy = actions + noise
+            else:
+                actions_noisy = actions
+
+            # 2. Compute Energy
+            energy_sum = self.model(actions_noisy, cond_list)
+            
+            # 3. Compute Gradient of Energy w.r.t Actions
+            # We want to MINIMIZE energy, so we move opposite to gradient
+            grad = torch.autograd.grad(
+                outputs=energy_sum,
+                inputs=actions,
+                create_graph=create_graph # Key for backprop through optimization
+            )[0]
+            
+            # 4. Clip Gradient
+            if self.clip_grad_value > 0:
+                grad = torch.clamp(grad, -self.clip_grad_value, self.clip_grad_value)
+            
+            # 5. Update Actions (Gradient Descent)
+            alpha = torch.clamp(self.alpha, min=1e-5, max=1.0)
+            actions_new = actions - alpha * grad
+            
+            # 6. Clamp Actions
+            if self.clamp_actions_value > 0:
+                actions_new = torch.clamp(actions_new, -self.clamp_actions_value, self.clamp_actions_value)
+                
+            return actions_new
 
     def forward(self, vl_embs_list: List[torch.Tensor], actions: torch.Tensor, state: Optional[torch.Tensor] = None):
         """
-        1. Sample Negatives (Fantasies).
-        2. Compute BCE Loss (Real vs Fake) + L2 Regularization.
+        Training Forward Pass (Implicit Differentiation / Unrolled Optimization).
+        
+        1. Initialize random actions (Noise).
+        2. Refine them using the model's energy function (Gradient Descent).
+        3. Loss = MSE(Refined Actions, Ground Truth Actions).
+        
+        This forces the energy manifold to be shaped such that GD leads to GT.
         """
-        # Align VLM layers to EBT layers
+        # Align Layer Depth
         if len(vl_embs_list) > len(self.model.layers):
             vl_embs_list = vl_embs_list[-len(self.model.layers):]
             
-        # 1. Generate Negatives (Langevin Chains)
-        initial_negatives = torch.randn_like(actions)
-        negatives = self.langevin_sampler(
-            initial_negatives, vl_embs_list, 
-            n_steps=self.train_n_mcmc, step_size=self.alpha, noise_scale=self.mcmc_noise_scale
-        )
+        B, T, D = actions.shape
+        device = actions.device
         
-        # 2. Compute Energies (Positive = Real, Negative = Fake)
-        energy_pos = self.model(actions, vl_embs_list)
-        energy_neg = self.model(negatives.detach(), vl_embs_list)
+        # 1. Initialize corrupted/random actions
+        # The provided code initializes from pure Gaussian noise
+        predicted_actions = torch.randn((B, T, D), device=device, dtype=actions.dtype)
         
-        # 3. Compute Loss
-        # We treat (-Energy) as Logits.
-        # Real Actions -> Label 1 (High Logit, Low Energy)
-        # Fake Actions -> Label 0 (Low Logit, High Energy)
+        # 2. MCMC Refinement Loop
+        for step in range(self.train_inference_steps):
+            # Crucial: Only create graph on the LAST step to save memory, 
+            # unless you want full unrolling (expensive). 
+            # The provided code snippet uses `create_graph` only on the last step.
+            is_last_step = (step == self.train_inference_steps - 1)
+            
+            predicted_actions = self._mcmc_step(
+                predicted_actions, 
+                vl_embs_list, 
+                create_graph=is_last_step, 
+                add_noise=True
+            )
+            
+            # If not last step, detach to prevent massive graph build-up
+            if not is_last_step:
+                predicted_actions = predicted_actions.detach()
+
+        # 3. Compute Reconstruction Loss
+        # Force the "Stable State" of the energy model to match Ground Truth
+        loss = F.mse_loss(predicted_actions, actions)
         
-        cat_logits = torch.cat([-energy_pos, -energy_neg], dim=0)
-        cat_labels = torch.cat([
-            torch.ones_like(energy_pos), 
-            torch.zeros_like(energy_neg)
-        ], dim=0)
-        
-        # Binary Cross Entropy Loss
-        bce_loss = F.binary_cross_entropy_with_logits(cat_logits, cat_labels)
-        
-        # L2 Regularization on Energy Magnitudes
-        reg_loss = self.energy_reg_weight * (energy_pos**2 + energy_neg**2).mean()
-        
-        return bce_loss + reg_loss
+        return loss
 
     @torch.no_grad()
     def predict_action(self, vl_embs_list: List[torch.Tensor], state: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Inference: Minimize Energy starting from noise.
+        Inference: Run MCMC without building graph.
         """
         if len(vl_embs_list) > len(self.model.layers):
             vl_embs_list = vl_embs_list[-len(self.model.layers):]
@@ -239,15 +277,19 @@ class LayerwiseEBTActionHead(nn.Module):
         B = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
         
-        actions = torch.randn((B, self.horizon, self.action_dim), device=device)
+        # Initialize from noise
+        predicted_actions = torch.randn((B, self.horizon, self.action_dim), device=device)
         
-        with torch.enable_grad():
-             actions = self.langevin_sampler(
-                actions, vl_embs_list, 
-                n_steps=self.inference_n_mcmc, step_size=self.alpha.abs(), noise_scale=0.0
+        # Run refinement
+        for step in range(self.inference_steps):
+            predicted_actions = self._mcmc_step(
+                predicted_actions, 
+                vl_embs_list, 
+                create_graph=False, 
+                add_noise=(self.langevin_noise_std > 0)
             )
-        
-        return actions.detach()
+            
+        return predicted_actions
 
 def get_action_model(config=None):
     return LayerwiseEBTActionHead(full_config=config)
