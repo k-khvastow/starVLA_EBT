@@ -29,8 +29,8 @@ from starVLA.model.tools import FRAMEWORK_REGISTRY
 # ⚠️ Warning: This framework has been modified to use EBT.
 ####################################################
 
-@FRAMEWORK_REGISTRY.register("QwenPI")
-class Qwen_PI(baseframework):
+@FRAMEWORK_REGISTRY.register("QwenEBT")
+class QwenEBT(baseframework):
     """
     Multimodal vision-language-action model (EBT Version).
 
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     if not hasattr(cfg.framework.action_model, "repeated_diffusion_steps"):
         cfg.trainer.repeated_diffusion_steps = 4 # repurposed for train MCMC steps
 
-    model = Qwen_PI(cfg)
+    model = QwenEBT(cfg)
     print(model)
 
     # fake sample 

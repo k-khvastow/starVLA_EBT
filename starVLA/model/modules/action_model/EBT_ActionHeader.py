@@ -7,7 +7,7 @@ Uses Differentiable Langevin Dynamics for training and inference.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from starVLA.model.modules.action_model.ebt_modules import TransformerForEBT
+from starVLA.model.modules.action_model.ebt_modules import TransformerForEBT_Layerwise
 
 class EBT_ActionHead(nn.Module):
     def __init__(self, config):
