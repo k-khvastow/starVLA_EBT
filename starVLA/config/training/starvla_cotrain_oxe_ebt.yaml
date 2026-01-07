@@ -2,8 +2,8 @@ run_id: qwenact_ebt_toolhang
 run_root_dir: results/Checkpoints
 seed: 42
 trackers: [jsonl, wandb]
-wandb_entity: your_wandb_entity
-wandb_project: llavavla
+wandb_entity: kirill-khvastow-technical-university-of-munich
+wandb_project: RecurrentVLA_LIBERO_Debug
 is_debug: false
 
 framework:
@@ -56,7 +56,8 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/OXE_LEROBOT_DATASET
-    data_mix: bridge_rt_1 
+    data_mix: bridge_rt_1
+    video_backend: torchvision_av
     action_type: delta_ee
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     CoT_answer: bbox
