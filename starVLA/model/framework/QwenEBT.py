@@ -128,7 +128,7 @@ class QwenEBT(baseframework):
             action_loss = self.action_model(last_hidden, actions_target, state_tensor)
         return {"action_loss": action_loss}
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def predict_action( # TODO align  predict_action with forward, make api more flexible
         self,
         examples: List[dict] = None,

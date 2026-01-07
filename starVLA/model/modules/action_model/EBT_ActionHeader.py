@@ -7,7 +7,7 @@ Uses Differentiable Langevin Dynamics for training and inference.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from starVLA.model.modules.action_model.ebt_modules import TransformerForEBT_Layerwise
+from starVLA.model.modules.action_model.EBT_modules.ebt_modules import TransformerForEBT_Layerwise
 
 class EBT_ActionHead(nn.Module):
     def __init__(self, config):
@@ -38,16 +38,13 @@ class EBT_ActionHead(nn.Module):
         self.max_cond_len = action_cfg.get('max_seq_len', 2048)
 
         # --- 2. Initialize Energy Function Model ---
-        self.model = TransformerForEBT(
+        self.model = TransformerForEBT_Layerwise(
             action_dim=self.action_dim,
-            horizon=self.horizon,
-            n_obs_steps=self.max_cond_len, 
             cond_dim=self.cond_dim,
-            n_emb=self.n_emb,
-            obs_as_cond=True,
-            n_layer=self.n_layer, 
+            horizon=self.horizon,
+            n_layer=self.n_layer,
             n_head=self.n_head,
-            p_drop_emb=self.dropout
+            n_emb=self.n_emb
         )
         
         # --- 3. Learnable Step Size (Alpha) ---
@@ -64,10 +61,11 @@ class EBT_ActionHead(nn.Module):
         
         # Forward pass through EBT to get Energy scalar
         energy = self.model(actions, cond)
+        energy_sum = energy.sum()
         
         # Calculate Gradient of Energy w.r.t Actions
         # We sum energy to get a scalar for autograd
-        grad = torch.autograd.grad(energy.sum(), actions, create_graph=create_graph)[0]
+        grad = torch.autograd.grad(energy_sum, actions, create_graph=create_graph, only_inputs=True, allow_unused=False)[0]
         
         # Clamp gradients for numerical stability
         grad = torch.clamp(grad, -1.0, 1.0)
@@ -90,6 +88,8 @@ class EBT_ActionHead(nn.Module):
         Returns:
             loss: Scalar MSE loss between refined actions and Ground Truth
         """
+        if isinstance(cond_features, torch.Tensor):
+            cond_features = [cond_features] * self.n_layer
         # 1. Initialize actions from Gaussian Noise
         current_actions = torch.randn_like(gt_actions)
         
@@ -110,33 +110,43 @@ class EBT_ActionHead(nn.Module):
         loss = F.mse_loss(current_actions, gt_actions)
         return loss
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def predict_action(self, cond_features, state=None):
         """
         Inference: Iterative Energy Minimization
-        Returns:
-            actions: [B, Horizon, Action_Dim]
         """
-        B = cond_features.shape[0]
-        device = cond_features.device
+        # Ensure input is a list for Layerwise Transformer
+        if isinstance(cond_features, torch.Tensor):
+            cond_features = [cond_features] * self.n_layer
+            
+        B = cond_features[0].shape[0]
+        device = cond_features[0].device
         
-        # 1. Start from Gaussian Noise
+        # 1. Initialize actions from Gaussian Noise
+        # We perform initialization OUTSIDE the gradient loop to treat it as a constant starting point
         current_actions = torch.randn(
             B, self.horizon, self.action_dim, device=device
         )
         
-        # 2. Iterative Refinement
-        # We must enable grad for inputs (actions) even in inference mode 
-        # because the model relies on dEnergy/dAction
+        # 2. Iterative Refinement (Langevin Dynamics)
+        # We explicitly enable gradients because inference usually runs in no_grad
         with torch.enable_grad():
             for _ in range(self.inf_mcmc_steps):
+                # Detach current actions from previous iteration's graph to save memory
+                # and prevent growing graph history. We treat the previous step as a constant "input".
+                current_actions = current_actions.detach()
+                current_actions.requires_grad_(True)
+                
+                # Perform one step. create_graph=False is fine here because we don't need
+                # second-order derivatives (we just update the action value).
                 current_actions = self._mcmc_step(
                     current_actions, 
                     cond_features, 
                     create_graph=False
                 )
                 
-        return current_actions
+        # Detach final result to return a clean tensor
+        return current_actions.detach()[:, -8:, :]
 
 def get_action_model(config=None):
     """
